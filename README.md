@@ -26,13 +26,14 @@ hand-sign-recognizer/
 pip install tensorflow mediapipe opencv-python scikit-learn matplotlib pandas numpy
 ```
 
-### 2. Download the dataset
+### 2. Dataset
 
-Download [Sign Language MNIST](https://www.kaggle.com/datasets/datamunge/sign-language-mnist) from Kaggle and place the CSV files inside:
+The Sign Language MNIST CSV files and reference images are included in the repository:
 ```
 Sign Language Dataset/sign_mnist_train.csv
 Sign Language Dataset/sign_mnist_test.csv
 ```
+The dataset is also available from [Kaggle](https://www.kaggle.com/datasets/datamunge/sign-language-mnist).
 
 ### 3. Download the MediaPipe Hand Landmarker model
 
@@ -98,5 +99,4 @@ A B C D E F G H I K L M N O P Q R S T U V W X Y
 ## Notes
 
 - `sign_language_cnn.h5` and `hand_landmarker.task` are **not** tracked in git (too large / auto-generated).
-- The dataset CSV files are also excluded (83 MB train + 22 MB test).
 - A local backup of key source files is kept in `backup_working/` (also excluded from git).
