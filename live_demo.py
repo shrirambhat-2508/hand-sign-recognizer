@@ -22,6 +22,12 @@ TASK_PATH = BASE_DIR / "hand_landmarker.task"
 # Sign Language MNIST labels (0-8 -> A-I, 10-24 -> K-Y; J and Z require motion)
 CLASSES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 LABELS = [chr(ord("A") + c) for c in CLASSES]
+HISTORY_FRAMES = 8
+MIN_HISTORY_FRAMES = 3
+MIN_AGREEMENT = 0.60
+MIN_CONFIDENCE = 55.0
+MIN_CONFIDENCE_MARGIN = 5.0
+STABLE_SECONDS = 0.75
 
 
 def preprocess_hand_crop(frame: np.ndarray, hand_landmarks, padding: int = 28):
@@ -55,28 +61,16 @@ def preprocess_hand_crop(frame: np.ndarray, hand_landmarks, padding: int = 28):
     return normalized, (x1, y1, x2, y2)
 
 
-def predict_with_recheck(model, inp_normalized):
-    """Evaluates the hand crop in both original and mirrored orientations to handle both hands correctly."""
-    probs_orig = model.predict(inp_normalized, verbose=0)[0]
-    inp_flipped = np.flip(inp_normalized, axis=2)
-    probs_flipped = model.predict(inp_flipped, verbose=0)[0]
-
-    max_orig = float(np.max(probs_orig))
-    max_flip = float(np.max(probs_flipped))
-
-    # Pick the orientation that gives the strongest model consensus
-    if max_orig >= max_flip:
-        best_probs = probs_orig
-        best_inp = inp_normalized
-        best_conf = max_orig * 100.0
-    else:
-        best_probs = probs_flipped
-        best_inp = inp_flipped
-        best_conf = max_flip * 100.0
-
-    idx = int(np.argmax(best_probs))
+def predict_hand(model, inp_normalized):
+    """Predicts one crop in the same orientation used by the training data."""
+    probabilities = model.predict(inp_normalized, verbose=0)[0]
+    ranked = np.argsort(probabilities)[::-1]
+    idx = int(ranked[0])
+    best_conf = float(probabilities[idx]) * 100.0
+    runner_up_conf = float(probabilities[ranked[1]]) * 100.0
+    confidence_margin = best_conf - runner_up_conf
     letter = LABELS[idx] if idx < len(LABELS) else "?"
-    return letter, best_conf, best_inp
+    return letter, best_conf, confidence_margin, inp_normalized
 
 
 def save_session_outputs(log_records: list) -> None:
@@ -95,19 +89,35 @@ def save_session_outputs(log_records: list) -> None:
     avg_conf = df["confidence"].mean()
     total_detections = len(df)
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("=" * 60 + "\n")
-        f.write("LIVE SIGN LANGUAGE DEMO - SESSION EVALUATION REPORT\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Session Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Total Verified Detections: {total_detections}\n")
-        f.write(f"Average Verified Confidence: {avg_conf:.2f}%\n\n")
-        f.write("Detected Signs Breakdown:\n")
-        for letter, count in letter_counts.items():
-            pct = (count / total_detections) * 100.0
-            f.write(f"  Letter '{letter}': {count} detection(s) ({pct:.1f}%)\n")
-        f.write("\n" + "=" * 60 + "\n")
+    report_lines = [
+        "=" * 60,
+        "LIVE SIGN LANGUAGE DEMO - SESSION SUMMARY",
+        "=" * 60,
+        "",
+        f"Session Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total Confirmed Sign Events: {total_detections}",
+        f"Average Verified Confidence: {avg_conf:.2f}%",
+        "",
+        "Detected Signs Breakdown:",
+    ]
+    for letter, count in letter_counts.items():
+        pct = (count / total_detections) * 100.0
+        report_lines.append(
+            f"  Letter '{letter}': {count} event(s) ({pct:.1f}%)"
+        )
+    report_lines.extend(
+        [
+            "",
+            "Accuracy, precision, recall, and F1-score are not calculated for "
+            "live detections because the session does not collect ground-truth "
+            "labels for the signs shown to the camera.",
+            "=" * 60,
+        ]
+    )
+    report_text = "\n".join(report_lines)
+    report_path.write_text(report_text, encoding="utf-8")
     print(f"Saved live evaluation report to {report_path}")
+    print("\n" + report_text)
 
     summary_chart_path = OUTPUT_DIR / "live_detection_summary.png"
     plt.figure(figsize=(10, 5))
@@ -146,10 +156,13 @@ def main() -> None:
         raise RuntimeError("Could not open webcam (index 0).")
 
     timestamp_ms = 0
-    history_buffer = deque(maxlen=8)
+    history_buffer = deque(maxlen=HISTORY_FRAMES)
     log_records = []
     status_banner = ""
     status_timer = 0.0
+    stable_letter = None
+    stable_since = 0.0
+    last_logged_letter = None
 
     print(f"\nLive demo running. All captured outputs will be saved to: {OUTPUT_DIR}")
     print("Controls: SPACE = Capture snapshot to live_outputs | Q = Quit & Save report\n")
@@ -160,8 +173,8 @@ def main() -> None:
             if not ret:
                 break
 
-            # Mirror the frame horizontally so it acts like a natural mirror for the user
-            frame = cv2.flip(frame, 1)
+            # Keep the camera orientation unchanged; mirroring can change the
+            # ASL class and the CNN was trained on unmirrored Sign-MNIST images.
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms += 33
@@ -181,46 +194,78 @@ def main() -> None:
                 if inp is not None and box is not None:
                     x1, y1, x2, y2 = box
 
-                    # Dual-orientation prediction and recheck
-                    raw_letter, raw_conf, best_inp = predict_with_recheck(model, inp)
+                    # Predict from the unmirrored crop, then stabilize across frames.
+                    raw_letter, raw_conf, confidence_margin, best_inp = predict_hand(model, inp)
                     current_inp = best_inp
 
                     # Add prediction to rolling temporal history buffer
-                    history_buffer.append((raw_letter, raw_conf))
+                    history_buffer.append((raw_letter, raw_conf, confidence_margin))
 
                     # Multi-frame consensus recheck (comparing last 8 frames)
                     letters_in_window = [item[0] for item in history_buffer]
                     counts = Counter(letters_in_window)
                     most_common_letter, top_count = counts.most_common(1)[0]
                     agreement_ratio = top_count / len(history_buffer)
-                    letter_confs = [c for l, c in history_buffer if l == most_common_letter]
+                    letter_confs = [c for l, c, margin in history_buffer if l == most_common_letter]
+                    letter_margins = [margin for l, c, margin in history_buffer if l == most_common_letter]
                     avg_conf = float(np.mean(letter_confs))
+                    avg_margin = float(np.mean(letter_margins))
 
-                    # Only verify and confirm when multiple frames agree consistently
-                    if len(history_buffer) >= 4 and agreement_ratio >= 0.65 and avg_conf >= 55.0:
+                    # Confirm after a short, consistent consensus; display the
+                    # measured gates during rechecking so a stuck state is diagnosable.
+                    if (
+                        len(history_buffer) >= MIN_HISTORY_FRAMES
+                        and agreement_ratio >= MIN_AGREEMENT
+                        and avg_conf >= MIN_CONFIDENCE
+                        and avg_margin >= MIN_CONFIDENCE_MARGIN
+                    ):
                         current_letter = most_common_letter
                         current_conf = avg_conf
-                        box_color = (0, 255, 0)  # Green = Verified & Stable
-                        display_text = f"Sign: {current_letter} ({current_conf:.1f}%) [Verified]"
 
-                        # Log verified prediction (throttled to avoid flooding)
-                        log_records.append(
-                            {
-                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                                "letter": current_letter,
-                                "confidence": round(current_conf, 2),
-                            }
-                        )
+                        # Require a brief stable hold to avoid logging transient
+                        # frame predictions as separate sign events.
+                        now = time.time()
+                        if stable_letter != most_common_letter:
+                            stable_letter = most_common_letter
+                            stable_since = now
+                            last_logged_letter = None
+
+                        if now - stable_since >= STABLE_SECONDS:
+                            box_color = (0, 255, 0)  # Green = Verified & Stable
+                            display_text = f"Sign: {current_letter} ({current_conf:.1f}%) [Verified]"
+
+                        if now - stable_since >= STABLE_SECONDS and last_logged_letter != current_letter:
+                            log_records.append(
+                                {
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                                    "letter": current_letter,
+                                    "confidence": round(current_conf, 2),
+                                }
+                            )
+                            last_logged_letter = current_letter
+                        elif now - stable_since < STABLE_SECONDS:
+                            box_color = (0, 215, 255)
+                            display_text = f"Sign: {most_common_letter} (Holding...)"
                     else:
                         current_letter = most_common_letter
                         current_conf = avg_conf
                         box_color = (0, 215, 255)  # Amber/Yellow = Rechecking & Stabilizing
-                        display_text = f"Sign: {most_common_letter} (Rechecking... hold steady)"
+                        display_text = (
+                            f"Rechecking {most_common_letter}: "
+                            f"agree {agreement_ratio:.0%}, conf {avg_conf:.0f}%, "
+                            f"margin {avg_margin:.0f}%"
+                        )
+                        stable_letter = None
+                        stable_since = 0.0
+                        last_logged_letter = None
 
                     # Draw the bounding box
                     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
             else:
                 history_buffer.clear()
+                stable_letter = None
+                stable_since = 0.0
+                last_logged_letter = None
 
             # Top instructions banner
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 44), (30, 30, 30), -1)

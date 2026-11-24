@@ -4,10 +4,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import LabelBinarizer
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D
+from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, Input, MaxPooling2D
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.layers import RandomRotation, RandomZoom
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,7 +85,12 @@ def load_dataset(data_dir: Path):
 def build_model(num_classes: int) -> Sequential:
     model = Sequential(
         [
-            Conv2D(32, (3, 3), activation="relu", input_shape=IMAGE_SHAPE),
+            Input(shape=IMAGE_SHAPE),
+            # Augment the 28x28 training images so the CNN becomes less sensitive
+            # to small differences in position, scale, and left/right orientation.
+            RandomRotation(0.08),
+            RandomZoom(0.10),
+            Conv2D(32, (3, 3), activation="relu"),
             MaxPooling2D((2, 2)),
             Conv2D(64, (3, 3), activation="relu"),
             MaxPooling2D((2, 2)),
@@ -106,14 +114,53 @@ def main() -> None:
     print(f"Loaded {len(x_train)} training and {len(x_test)} test images.")
     print(f"Labels represented: {classes.tolist()}")
 
+    # Reserve a separate, stratified validation set before training.
+    # It is kept out of training and used to stop or tune the model reliably.
+    train_indices = np.argmax(y_train, axis=1)
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train,
+        y_train,
+        test_size=0.10,
+        random_state=42,
+        stratify=train_indices,
+    )
+    print(
+        f"Training split: {len(x_train)} images; "
+        f"validation split: {len(x_val)} images."
+    )
+
     model = build_model(num_classes=len(classes))
     history = model.fit(
         x_train,
         y_train,
-        epochs=10,
+        epochs=30,
         batch_size=64,
-        validation_split=0.1,
+        verbose=2,
+        validation_data=(x_val, y_val),
+        callbacks=[
+            # Restore the model weights from the epoch with the best validation
+            # accuracy instead of keeping the weights from the last epoch.
+            EarlyStopping(
+                monitor="val_accuracy",
+                patience=5,
+                restore_best_weights=True,
+                mode="max",
+            ),
+            # Reduce the learning rate when validation loss stops improving.
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=2,
+                min_lr=1e-6,
+            ),
+        ],
     )
+
+    # Validation accuracy measures fitting quality during development.
+    # Test accuracy is reported separately and must be measured only after training.
+    val_loss, val_accuracy = model.evaluate(x_val, y_val, verbose=0)
+    print(f"Validation loss: {val_loss:.4f}")
+    print(f"Validation accuracy: {val_accuracy:.4f}")
 
     test_loss, test_accuracy = model.evaluate(x_test, y_test, verbose=0)
     print(f"Test loss: {test_loss:.4f}")
@@ -138,16 +185,37 @@ def main() -> None:
     y_true_arr = np.array(y_true_letters)
     y_pred_arr = np.array(y_pred_letters)
 
-    print("\nClassification Report:")
-    print(
-        classification_report(
-            y_true_letters,
-            y_pred_letters,
-            labels=letter_labels,
-            target_names=letter_labels,
-            zero_division=0,
-        )
+    test_report = classification_report(
+        y_true_letters,
+        y_pred_letters,
+        labels=letter_labels,
+        target_names=letter_labels,
+        output_dict=True,
+        zero_division=0,
     )
+    test_report_text = classification_report(
+        y_true_letters,
+        y_pred_letters,
+        labels=letter_labels,
+        target_names=letter_labels,
+        zero_division=0,
+    )
+    macro_scores = test_report["macro avg"]
+    weighted_scores = test_report["weighted avg"]
+    metrics_report_text = (
+        "TEST SET OVERALL METRICS\n"
+        + "=" * 60
+        + f"\nAccuracy: {test_accuracy:.4%}"
+        + f"\nMacro precision: {macro_scores['precision']:.4f}"
+        + f"\nMacro recall: {macro_scores['recall']:.4f}"
+        + f"\nMacro F1-score: {macro_scores['f1-score']:.4f}"
+        + f"\nWeighted precision: {weighted_scores['precision']:.4f}"
+        + f"\nWeighted recall: {weighted_scores['recall']:.4f}"
+        + f"\nWeighted F1-score: {weighted_scores['f1-score']:.4f}"
+    )
+    print("\nPer-class test metrics:")
+    print(test_report_text)
+    print("\n" + metrics_report_text)
 
     # 1. Training Curves (Accuracy & Loss side-by-side with Overfitting / Underfitting Diagnosis)
     epochs_range = range(1, len(history.history["accuracy"]) + 1)
@@ -156,43 +224,85 @@ def main() -> None:
     train_loss = history.history["loss"]
     val_loss = history.history["val_loss"]
 
-    final_train_acc = train_acc[-1]
+    final_augmented_train_acc = train_acc[-1]
     final_val_acc = val_acc[-1]
-    final_train_loss = train_loss[-1]
+    final_augmented_train_loss = train_loss[-1]
     final_val_loss = val_loss[-1]
-    acc_gap = final_train_acc - final_val_acc
+    # Keras records training metrics while augmentation is active, but validation
+    # metrics use original images. Evaluate the training split without augmentation
+    # for a fair train-versus-validation comparison in the diagnostic.
+    train_eval_loss, train_eval_acc = model.evaluate(x_train, y_train, verbose=0)
+    acc_gap = train_eval_acc - final_val_acc
 
-    # Diagnose whether the model is Overfitting, Underfitting, or Well-Fitted (True Learning)
-    if final_train_acc < 0.80 and final_val_acc < 0.80:
+    # Diagnose overfitting from a widening train/validation gap or validation
+    # performance declining; line connectivity itself is not evidence of it.
+    validation_accuracy_drop = max(val_acc) - final_val_acc
+    if train_eval_acc < 0.80 and final_val_acc < 0.80:
         fit_status = "Underfitting Detected"
         status_desc = "The model has not learned sufficient visual features (Accuracy < 80%)."
         status_color = "#c0392b"  # Red
-    elif acc_gap > 0.08 or (final_val_loss > val_loss[0] and final_train_loss < 0.1):
+    elif acc_gap > 0.08 or (
+        validation_accuracy_drop > 0.05 and train_eval_acc > final_val_acc
+    ):
         fit_status = "Overfitting Detected (Memorization)"
-        status_desc = f"The model memorized training patterns rather than general signs (Validation Gap: {acc_gap * 100:.1f}%)."
+        status_desc = (
+            f"Training/validation accuracy gap: {acc_gap * 100:.1f}%; "
+            f"validation accuracy fell {validation_accuracy_drop * 100:.1f} "
+            "points from its peak."
+        )
+        status_color = "#e67e22"  # Orange
+    elif final_val_acc - test_accuracy > 0.05:
+        fit_status = "Validation/Test Generalization Gap"
+        status_desc = (
+            f"Validation accuracy ({final_val_acc * 100:.1f}%) exceeds "
+            f"independent test accuracy ({test_accuracy * 100:.1f}%) by "
+            f"{(final_val_acc - test_accuracy) * 100:.1f} points."
+        )
         status_color = "#e67e22"  # Orange
     else:
-        fit_status = "Well-Fitted (True Learning & Generalization)"
-        status_desc = f"The model learned genuine visual features with strong generalization (Gap: {acc_gap * 100:.1f}%)."
+        fit_status = "No Clear Overfitting Signal"
+        status_desc = (
+            f"Unaugmented train/validation accuracy gap: "
+            f"{acc_gap * 100:.1f}%; independent test accuracy: "
+            f"{test_accuracy * 100:.1f}%."
+        )
         status_color = "#1e8449"  # Green
 
     print("\n" + "=" * 70)
     print("TRAINING DIAGNOSTIC: OVERFITTING / UNDERFITTING ASSESSMENT")
     print("=" * 70)
-    print(f"Final Training Accuracy    : {final_train_acc * 100:.2f}%")
+    print(f"Final Augmented Training Accuracy: {final_augmented_train_acc * 100:.2f}%")
+    print(f"Training Accuracy (no augmentation): {train_eval_acc * 100:.2f}%")
     print(f"Final Validation Accuracy  : {final_val_acc * 100:.2f}%")
     print(f"Generalization Accuracy Gap: {acc_gap * 100:.2f}%")
-    print(f"Final Training Loss        : {final_train_loss:.4f}")
+    print(f"Training Loss (no augmentation): {train_eval_loss:.4f}")
+    print(f"Final Augmented Training Loss: {final_augmented_train_loss:.4f}")
     print(f"Final Validation Loss      : {final_val_loss:.4f}")
+    print(f"Independent Test Accuracy  : {test_accuracy * 100:.2f}%")
     print(f"Diagnostic Status          : {fit_status}")
     print(f"Interpretation             : {status_desc}")
     print("=" * 70 + "\n")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Plot Accuracy curves with point markers and final score callouts
-    ax1.plot(epochs_range, train_acc, "b-o", linewidth=2, markersize=6, label=f"Training Accuracy ({final_train_acc:.1%})")
-    ax1.plot(epochs_range, val_acc, "r--s", linewidth=2, markersize=6, label=f"Validation Accuracy ({final_val_acc:.1%})")
+    # Connect observed epoch measurements to show how each metric changes
+    # throughout training; overfitting is assessed from metric divergence.
+    ax1.plot(
+        epochs_range,
+        train_acc,
+        "b-o",
+        linewidth=2,
+        markersize=6,
+        label=f"Training Accuracy - augmented ({final_augmented_train_acc:.1%})",
+    )
+    ax1.plot(
+        epochs_range,
+        val_acc,
+        "r--s",
+        linewidth=2,
+        markersize=6,
+        label=f"Validation Accuracy ({final_val_acc:.1%})",
+    )
     ax1.set_title("Training vs. Validation Accuracy", fontsize=13, weight="bold")
     ax1.set_xlabel("Epoch", fontsize=11, weight="bold")
     ax1.set_ylabel("Accuracy", fontsize=11, weight="bold")
@@ -200,9 +310,23 @@ def main() -> None:
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.legend(loc="lower right", fontsize=10)
 
-    # Plot Loss curves with point markers and final score callouts
-    ax2.plot(epochs_range, train_loss, "b-o", linewidth=2, markersize=6, label=f"Training Loss ({final_train_loss:.4f})")
-    ax2.plot(epochs_range, val_loss, "r--s", linewidth=2, markersize=6, label=f"Validation Loss ({final_val_loss:.4f})")
+    # Connect loss measurements for the same epoch-by-epoch view.
+    ax2.plot(
+        epochs_range,
+        train_loss,
+        "b-o",
+        linewidth=2,
+        markersize=6,
+        label=f"Training Loss - augmented ({final_augmented_train_loss:.4f})",
+    )
+    ax2.plot(
+        epochs_range,
+        val_loss,
+        "r--s",
+        linewidth=2,
+        markersize=6,
+        label=f"Validation Loss ({final_val_loss:.4f})",
+    )
     ax2.set_title("Training vs. Validation Loss", fontsize=13, weight="bold")
     ax2.set_xlabel("Epoch", fontsize=11, weight="bold")
     ax2.set_ylabel("Loss", fontsize=11, weight="bold")
@@ -290,6 +414,11 @@ def main() -> None:
         actual = c_tp + c_fn
         prec = c_tp / (c_tp + c_fp) if (c_tp + c_fp) > 0 else 0.0
         rec = c_tp / actual if actual > 0 else 0.0
+        f1 = (
+            2 * prec * rec / (prec + rec)
+            if (prec + rec) > 0
+            else 0.0
+        )
         table_data.append(
             {
                 "Letter": letter,
@@ -300,6 +429,7 @@ def main() -> None:
                 "TN": c_tn,
                 "Precision": round(prec, 4),
                 "Recall": round(rec, 4),
+                "F1-score": round(f1, 4),
             }
         )
 
@@ -323,6 +453,7 @@ def main() -> None:
             f"{row['TN']:,}",
             f"{row['Precision']:.4f}",
             f"{row['Recall']:.4f}",
+            f"{row['F1-score']:.4f}",
         ]
         for row in table_data
     ]
@@ -335,6 +466,7 @@ def main() -> None:
         "TN",
         "Precision",
         "Recall",
+        "F1-score",
     ]
     table = ax.table(
         cellText=display_rows,
@@ -368,19 +500,55 @@ def main() -> None:
     plt.close()
     print(f"Saved table image to {table_img_path}")
 
-    # 5. Sample Predictions Plot (5x5 grid)
+    # 5. Representative Test Predictions (show errors as well as correct results)
+    sample_count = min(25, len(x_test))
+    mismatch_indices = np.flatnonzero(y_true_idx != y_pred_idx)
+    correct_indices = np.flatnonzero(y_true_idx == y_pred_idx)
+    rng = np.random.default_rng(42)
+
+    # Put up to half the available slots toward actual test errors so a small
+    # preview does not hide model mistakes just because early rows are easy.
+    error_count = min((sample_count + 1) // 2, len(mismatch_indices))
+    selected_errors = (
+        rng.choice(mismatch_indices, size=error_count, replace=False)
+        if error_count
+        else np.array([], dtype=int)
+    )
+    correct_count = min(sample_count - error_count, len(correct_indices))
+    selected_correct = (
+        rng.choice(correct_indices, size=correct_count, replace=False)
+        if correct_count
+        else np.array([], dtype=int)
+    )
+    sample_indices = np.concatenate((selected_errors, selected_correct))
+    rng.shuffle(sample_indices)
+
     plt.figure(figsize=(12, 12))
-    num_samples = 25
-    for i in range(num_samples):
-        plt.subplot(5, 5, i + 1)
-        # Use interpolation="nearest" to prevent matplotlib from blurring the 28x28 pixel images
-        plt.imshow(x_test[i].reshape(28, 28), cmap="gray", interpolation="nearest")
-        true_char = y_true_letters[i]
-        pred_char = y_pred_letters[i]
+    for plot_index, test_index in enumerate(sample_indices):
+        plt.subplot(5, 5, plot_index + 1)
+        # Keep the original 28x28 pixels visible without interpolation blur.
+        plt.imshow(
+            x_test[test_index].reshape(28, 28),
+            cmap="gray",
+            interpolation="nearest",
+        )
+        true_char = y_true_letters[test_index]
+        pred_char = y_pred_letters[test_index]
         color = "green" if true_char == pred_char else "red"
-        plt.title(f"True: {true_char} | Pred: {pred_char}", color=color, fontsize=11, weight="bold")
+        confidence = float(np.max(y_pred_probs[test_index])) * 100.0
+        plt.title(
+            f"True: {true_char} | Pred: {pred_char}\n"
+            f"Confidence: {confidence:.1f}%",
+            color=color,
+            fontsize=9,
+            weight="bold",
+        )
         plt.axis("off")
-    plt.suptitle("Sample Test Predictions (True vs. Predicted)", fontsize=16, weight="bold")
+    plt.suptitle(
+        "Representative Test Predictions (errors and correct)",
+        fontsize=16,
+        weight="bold",
+    )
     plt.tight_layout()
     sample_path = OUTPUT_DIR / "sample_predictions.png"
     plt.savefig(sample_path, dpi=300, bbox_inches="tight")
